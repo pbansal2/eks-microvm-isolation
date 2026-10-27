@@ -1,0 +1,167 @@
+###############################################################################
+# Agent code runner -- network isolation
+#
+# The runner is the blast radius of this whole project: it is the pod that is
+# eventually meant to execute untrusted, model-generated code. Everything else
+# in k8s/apps/ assumes this policy exists. Until it is applied the runner has
+# unrestricted egress -- measured 2026-10-23, a pod in this Deployment could
+# reach https://checkip.amazonaws.com and got a 200 back through the NAT
+# Gateway.
+#
+# ---------------------------------------------------------------------------
+# DEVIATION FROM THE REQUEST -- READ THIS FIRST
+#
+# The task specified ingress "ONLY from pods labeled `app: gateway`". There is
+# no pod with that label in this cluster. The gateway Deployment in
+# k8s/apps/gateway.yaml labels its pods:
+#
+#     app=control-plane-gateway,role=control-plane
+#
+# A policy written against `app: gateway` would have selected nothing, and
+# because this policy is default-deny, the result would have been a runner that
+# the gateway cannot reach at all -- a silent outage, not an error. The rule
+# below therefore uses the label that exists.
+#
+# `app: gateway` is deliberately NOT also listed. An allow rule for a label
+# that nothing currently carries is a standing hole: anyone able to create a
+# pod in this namespace could label it `app: gateway` and reach the runner. If
+# the gateway is ever renamed, change the one selector below to match.
+#
+# ---------------------------------------------------------------------------
+# HOW THE IMDS AND INTERNET BLOCK ACTUALLY WORKS
+#
+# The task asked to "specifically ensure" egress to 169.254.169.254 and the
+# public internet is blocked. There is no explicit entry for either below, and
+# that is correct, not an omission:
+#
+# NetworkPolicy has no deny rule. It only has allows, and naming a policyType
+# makes that direction default-deny for the selected pods. Listing `Egress` in
+# policyTypes denies ALL egress except the single DNS rule. IMDS, the internet,
+# the Kubernetes API server, other namespaces, and the node itself are all
+# blocked because nothing permits them.
+#
+# Writing it the other way -- an `ipBlock: 0.0.0.0/0` with an `except:` list
+# for 169.254.169.254 -- is the trap. That rule is an ALLOW: it would permit
+# egress to every address on the internet apart from the metadata service,
+# which is the opposite of what is wanted here. Do not "improve" the policy
+# that way.
+#
+# Defence in depth, not sole defence: the node already sets IMDSv2
+# `HttpTokens=required` with `HttpPutResponseHopLimit=1` (verified on
+# i-0123456789abcdef0, 2026-10-23), so a pod cannot mint a token and read the
+# node role credentials even without this policy. But the network path to
+# 169.254.169.254 is open today -- an unauthenticated GET from the runner
+# returns an HTTP 401 *from IMDS itself* in under 10ms, which proves packets
+# arrive and are answered. This policy closes the path.
+#
+# ---------------------------------------------------------------------------
+# CONSEQUENCES -- things that will break, by design
+#
+#   * No package installs. `pip install`, `apt-get`, and any outbound HTTP
+#     from the runner now fail. The runner image must already contain
+#     everything the workload needs.
+#   * No AWS API calls from the runner, including S3 and STS. If the runner
+#     ever legitimately needs one, add a VPC endpoint and an explicit egress
+#     rule to its prefix list -- do not widen this policy to 0.0.0.0/0.
+#   * No Kubernetes API access. (The runner's ServiceAccount token is already
+#     not mounted, so this costs nothing today.)
+#   * Kubelet probes to the runner are NOT exempted. The runner currently
+#     declares no livenessProbe or readinessProbe. If one is added, the probe
+#     originates from the node IP and this ingress rule will drop it, leaving
+#     pods permanently unready. Add an explicit ingress rule for the node CIDR
+#     at that point.
+#
+# NetworkPolicies are additive across objects: a second policy selecting the
+# same pods can only ever WIDEN what is permitted, never narrow it. Before
+# adding another policy to this namespace, check what it grants the runner.
+#
+# ---------------------------------------------------------------------------
+# PREREQUISITE
+#
+# Enforcement comes from the VPC CNI network policy agent, which is on:
+#
+#   kubectl -n kube-system get ds aws-node -o jsonpath=\
+#     '{.spec.template.spec.containers[?(@.name=="aws-eks-nodeagent")].args}'
+#   # => includes "--enable-network-policy=true"
+#
+# Without that flag the API server accepts this object and silently enforces
+# nothing. scripts/test-baseline.sh checks the flag before asserting anything.
+#
+# Apply and verify:
+#   kubectl apply -f k8s/security/runner-network-policy.yaml
+#   ./scripts/test-baseline.sh
+###############################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-runner-isolation
+  namespace: agent-sandbox
+  labels:
+    app: agent-runner
+    role: code-executor
+  annotations:
+    description: >-
+      Default-deny ingress and egress for the agent code runner. Permits only
+      gateway->runner:8080 and runner->cluster DNS. Blocks IMDS, the public
+      internet, and the Kubernetes API as a consequence of default-deny.
+spec:
+  # Selects the runner pods by the role label, not the app label, so a second
+  # code-executing Deployment inherits the isolation automatically.
+  podSelector:
+    matchLabels:
+      role: code-executor
+
+  # Naming both directions is what creates the default-deny. Dropping either
+  # entry leaves that direction wide open.
+  policyTypes:
+    - Ingress
+    - Egress
+
+  ingress:
+    # Only the control plane gateway, only TCP 8080.
+    #
+    # `from` has no namespaceSelector, which in NetworkPolicy means "pods in
+    # this policy's own namespace". A gateway deployed into another namespace
+    # would be denied; that is intended.
+    #
+    # Nothing in the runner listens on 8080 yet -- it runs a sleep loop. This
+    # rule is the contract for when the executor API lands, and
+    # scripts/test-baseline.sh starts a temporary listener to prove the path is
+    # open rather than asserting against a closed port.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: control-plane-gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+
+  egress:
+    # Cluster DNS only.
+    #
+    # `to` and `ports` are deliberately in the SAME list element, which means
+    # AND: port 53 to CoreDNS and nothing else. Splitting them into two
+    # elements of the `egress` list would mean OR -- port 53 to ANY address,
+    # plus EVERY port to CoreDNS. That is the most common way this policy gets
+    # silently widened in review.
+    #
+    # The selectors name the CoreDNS pods rather than the whole kube-system
+    # namespace, so the runner cannot reach metrics-server, aws-node, or the
+    # load balancer controller on port 53-shaped traffic.
+    #
+    # Pods resolve via the kube-dns ClusterIP (172.20.0.10). kube-proxy
+    # translates that to a CoreDNS pod IP before policy evaluation, so
+    # selecting the backing pods is the correct and portable form -- an
+    # ipBlock for the ClusterIP is not.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

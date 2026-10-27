@@ -1,0 +1,424 @@
+###############################################################################
+# Control Plane Gateway
+#
+# A minimal HTTP control-plane stub fronted by an AWS Network Load Balancer.
+#
+# SCHEME IS `internet-facing`, restricted to one source CIDR. Read the
+# "Exposure" note on the Service at the bottom of this file before changing
+# either. Do not `kubectl apply` this file directly -- the allow-list is a
+# placeholder that scripts/deploy-baseline.sh fills in.
+#
+# PREREQUISITE: the Service below uses the AWS Load Balancer Controller
+# annotation set (`aws-load-balancer-type: external`). That annotation tells
+# the legacy in-tree cloud provider to IGNORE this Service, so with no
+# controller installed the Service stays in <pending> forever and never gets
+# an address. scripts/deploy-baseline.sh refuses to proceed until the
+# controller is present.
+###############################################################################
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-sandbox
+  labels:
+    name: agent-sandbox
+    # Opt the namespace in to the restricted Pod Security Standard. Both
+    # workloads in k8s/apps/ already satisfy it; this makes a regression a
+    # rejected admission rather than a silently privileged pod.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane-gateway
+  namespace: agent-sandbox
+# No IRSA annotation: the stub calls no AWS API. Add
+# eks.amazonaws.com/role-arn here if that changes -- never the node role.
+automountServiceAccountToken: false
+---
+###############################################################################
+# Application source.
+#
+# Delivered as a ConfigMap rather than a built image because this repository
+# has no container build pipeline yet; the alternative (pip install at pod
+# start) fetches unpinned dependencies over NAT on every restart and breaks
+# when PyPI or the NAT Gateway is unavailable.
+#
+# This is why the stub is Python stdlib `http.server` and not FastAPI. To
+# switch to FastAPI, build an image, drop this ConfigMap and the volume, and
+# set the Deployment's `image`. The handler logic ports over unchanged.
+###############################################################################
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-plane-gateway-src
+  namespace: agent-sandbox
+data:
+  gateway.py: |
+    """Control plane gateway stub.
+
+    Authentication is a release gate, not a feature: this gateway's audience
+    is the sandbox operator, so every route except the probe endpoints
+    requires a verified bearer token. The verifier FAILS CLOSED -- if no
+    token is configured, gated routes return 503 and serve nothing.
+    """
+    import hmac
+    import json
+    import os
+    import signal
+    import sys
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    # Injected from the `control-plane-gateway-auth` Secret. Empty means
+    # "not configured", which is a hard failure, never an open door.
+    TOKEN = os.environ.get("GATEWAY_API_TOKEN", "")
+    POD = os.environ.get("POD_NAME", "unknown")
+    NODE = os.environ.get("NODE_NAME", "unknown")
+    PORT = int(os.environ.get("PORT", "8080"))
+
+    # Unauthenticated on purpose: kubelet probes and the NLB health check
+    # cannot present a credential. These return liveness only -- no cluster
+    # state, no identity, nothing an anonymous caller can act on.
+    PUBLIC_PATHS = frozenset(("/healthz", "/readyz"))
+
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "control-plane-gateway/0.1"
+        sys_version = ""
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, code, payload, headers=()):
+            body = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            for key, value in headers:
+                self.send_header(key, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        def _authenticated(self):
+            """True only for a request bearing a verified credential."""
+            if not TOKEN:
+                self._send(503, {
+                    "error": "gateway authentication is not configured",
+                    "detail": (
+                        "GATEWAY_API_TOKEN is empty. Create the "
+                        "control-plane-gateway-auth Secret and restart this "
+                        "Deployment. Refusing to serve until then."
+                    ),
+                })
+                return False
+
+            scheme, _, presented = self.headers.get("Authorization", "").partition(" ")
+            # compare_digest, not ==, so a wrong token cannot be recovered
+            # one byte at a time from response timing.
+            if scheme.lower() != "bearer" or not hmac.compare_digest(
+                presented.strip(), TOKEN
+            ):
+                self._send(
+                    401,
+                    {"error": "unauthorized"},
+                    headers=(("WWW-Authenticate", 'Bearer realm="control-plane-gateway"'),),
+                )
+                return False
+            return True
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+
+            if path in PUBLIC_PATHS:
+                self._send(200, {"status": "ok", "pod": POD})
+                return
+
+            if not self._authenticated():
+                return
+
+            if path == "/":
+                self._send(200, {
+                    "service": "control-plane-gateway",
+                    "pod": POD,
+                    "node": NODE,
+                    "routes": ["/healthz", "/readyz", "/", "/v1/dispatch"],
+                })
+            else:
+                self._send(404, {"error": "not found", "path": path})
+
+        def do_HEAD(self):
+            self.do_GET()
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if not self._authenticated():
+                return
+
+            if path == "/v1/dispatch":
+                # Deliberately unimplemented. Dispatching work to the agent
+                # runner is a privileged action; the shared bearer token
+                # above proves only that *a* caller is the operator, which is
+                # not the same as proving this caller may run code. Add
+                # per-caller identity and an action-level authorization check
+                # before implementing this route.
+                self._send(501, {
+                    "error": "not implemented",
+                    "detail": (
+                        "Dispatch requires per-caller authorization, not just "
+                        "authentication. See the comment in gateway.py."
+                    ),
+                })
+            else:
+                self._send(404, {"error": "not found", "path": path})
+
+        def log_message(self, fmt, *args):
+            # Request line and status only. Never the Authorization header.
+            sys.stdout.write(
+                "%s - %s\n" % (self.address_string(), fmt % args)
+            )
+            sys.stdout.flush()
+
+
+    def main():
+        if not TOKEN:
+            # Start anyway so probes pass and the operator can see *why* in
+            # the logs, rather than debugging a CrashLoopBackOff.
+            print(
+                "WARNING: GATEWAY_API_TOKEN is empty. All authenticated "
+                "routes will return 503 until the Secret is created.",
+                flush=True,
+            )
+
+        server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+        server.daemon_threads = True
+
+        def shutdown(signum, _frame):
+            print("received signal %d, shutting down" % signum, flush=True)
+            server.shutdown()
+
+        signal.signal(signal.SIGTERM, shutdown)
+        signal.signal(signal.SIGINT, shutdown)
+
+        print("listening on 0.0.0.0:%d as %s" % (PORT, POD), flush=True)
+        server.serve_forever()
+
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane-gateway
+  namespace: agent-sandbox
+  labels:
+    app: control-plane-gateway
+    role: control-plane
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: control-plane-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: control-plane-gateway
+        role: control-plane
+      annotations:
+        # Roll the pods when the source changes. Without this, editing the
+        # ConfigMap updates the mounted file but leaves the old process
+        # running the old code.
+        checksum/src-configmap: "replace-on-change"
+    spec:
+      serviceAccountName: control-plane-gateway
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Soft, not required: this cluster has one node, so a hard constraint
+      # would leave the second replica Pending forever.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: control-plane-gateway
+      containers:
+        - name: gateway
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-u", "/app/gateway.py"]
+          env:
+            - name: PORT
+              value: "8080"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GATEWAY_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  # Created by scripts/deploy-baseline.sh with a freshly
+                  # generated random value. No credential is stored in this
+                  # repository. `optional: true` so the pod starts and logs
+                  # the reason rather than crash-looping; the handler still
+                  # refuses every authenticated request.
+                  name: control-plane-gateway-auth
+                  key: token
+                  optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Binding 0.0.0.0 inside the container is correct: the Service
+          # targets the pod IP. Exposure is governed by the Service below,
+          # which is the actual network boundary.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: src
+              mountPath: /app
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: src
+          configMap:
+            name: control-plane-gateway-src
+            defaultMode: 0444
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-plane-gateway
+  namespace: agent-sandbox
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: control-plane-gateway
+---
+###############################################################################
+# Exposure
+#
+# scheme = "internet-facing": the NLB gets public addresses in the public
+# subnets and is reachable from the internet. Chosen deliberately so the
+# gateway can be driven from a laptop without an SSM tunnel.
+#
+# loadBalancerSourceRanges is what keeps that honest. The controller turns it
+# into node security group rules, so only the listed sources reach the
+# NodePort; everyone else is dropped before the gateway sees a packet. It is
+# NOT optional here -- omit it and the controller opens the NodePort to
+# 0.0.0.0/0, leaving the shared bearer token as the only control. See
+# Never 0.0.0.0/0 here, for the same reason the EKS endpoint never gets it.
+#
+# ROTATION: by default the allow-list is the deploying operator's egress
+# address. It goes stale exactly like the EKS endpoint allow-list does
+# (terraform/ISSUES-ENCOUNTERED.md issue 6), and it fails the same way -- as a
+# silent connection timeout, not a refusal. When that happens, re-run the
+# deploy, which re-discovers the address:
+#
+#   scripts/deploy-baseline.sh
+#
+# or patch it directly:
+#
+#   kubectl -n agent-sandbox patch svc control-plane-gateway --type=merge \
+#     -p '{"spec":{"loadBalancerSourceRanges":["<NEW_IP>/32"]}}'
+#
+# To return to the private shape, set `-scheme` back to "internal" and put
+# the VPC CIDR 10.0.0.0/16 in loadBalancerSourceRanges.
+#
+# `nlb-target-type: instance` registers the node, not the pod, so traffic is
+# SNATed by kube-proxy and the gateway sees node IPs as the client address.
+###############################################################################
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane-gateway
+  namespace: agent-sandbox
+  labels:
+    app: control-plane-gateway
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "external"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: "instance"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+    # Health check hits the unauthenticated /healthz. An NLB cannot present
+    # a bearer token, which is why that path is public.
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-protocol: "HTTP"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-path: "/healthz"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-port: "traffic-port"
+    service.beta.kubernetes.io/aws-load-balancer-healthcheck-interval: "10"
+    service.beta.kubernetes.io/aws-load-balancer-healthy-threshold-count: "2"
+    service.beta.kubernetes.io/aws-load-balancer-unhealthy-threshold-count: "2"
+    service.beta.kubernetes.io/aws-load-balancer-attributes: "load_balancing.cross_zone.enabled=true"
+spec:
+  type: LoadBalancer
+  # MANDATORY with an internet-facing scheme. Narrows the node security group
+  # rules the controller creates; without it the NodePort is open to the whole
+  # internet.
+  #
+  # PLACEHOLDER, deliberately not a valid CIDR. scripts/deploy-baseline.sh
+  # replaces it with GATEWAY_ALLOWED_CIDR (default: your own egress IP as a
+  # /32) and refuses 0.0.0.0/0. A raw `kubectl apply -f gateway.yaml` is
+  # therefore REJECTED by the API server ("must be a valid CIDR value") rather
+  # than shipping a stranger's address -- or no restriction at all -- as the
+  # allow-list. See the ROTATION note above when the address goes stale.
+  loadBalancerSourceRanges:
+    - "__GATEWAY_ALLOWED_CIDR__"
+  externalTrafficPolicy: Cluster
+  selector:
+    app: control-plane-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

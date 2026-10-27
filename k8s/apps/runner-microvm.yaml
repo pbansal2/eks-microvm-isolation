@@ -1,0 +1,203 @@
+###############################################################################
+# Agent Code Runner -- microVM variant
+#
+# This is k8s/apps/runner.yaml with ONE functional change:
+#
+#     spec.template.spec.runtimeClassName: kata-clh
+#
+# Everything else is byte-identical in effect: same name, same labels, same
+# selector, same nodeSelector, same resource requests and limits, same
+# securityContext, same volumes, same ServiceAccount. That matters for three
+# things that select on those fields and would break silently if they drifted:
+#
+#   * k8s/security/runner-network-policy.yaml  selects `role: code-executor`
+#   * k8s/apps/hpa.yaml                        targets Deployment/agent-runner
+#   * the HPA's 50% CPU target is 50% of the 100m *request* below
+#
+# ---------------------------------------------------------------------------
+# THIS FILE SUPERSEDES runner.yaml. NEVER APPLY BOTH.
+#
+# They declare the same Deployment, so whichever is applied last wins and the
+# other becomes a lie about the cluster. `runner.yaml` is kept as the runc
+# baseline -- the thing the kernel comparison in scripts/verify-microvm.sh
+# measures against, and the rollback target.
+#
+# The duplication is a real hazard: edit a resource limit in runner.yaml and
+# this file silently keeps the old one. scripts/verify-microvm.sh diffs the
+# two on every run and fails if any field other than runtimeClassName and the
+# header comments has diverged. That turns drift from silent into loud; it
+# does not prevent it. Make changes in both files, or delete one.
+#
+# ---------------------------------------------------------------------------
+# PREREQUISITE
+#
+# `runtimeClassName: kata-clh` is a hard scheduling and runtime requirement,
+# not a hint:
+#
+#   * The RuntimeClass must exist. Without it the pod is REJECTED at admission
+#     ("RuntimeClass ... not found"), so the Deployment reports
+#     unavailable replicas with no pod to inspect.
+#   * Its scheduling.nodeSelector requires `katacontainers.io/kata-runtime=true`,
+#     which kata-deploy sets only after a successful install. Missing it means
+#     the pod stays Pending forever, with a scheduling event rather than an
+#     error.
+#   * The node must expose /dev/kvm. This one fails latest and worst: the pod
+#     is admitted, scheduled, and then fails at VM start.
+#
+# Install first:  scripts/install-kata.sh      (RUNBOOK.md section 9)
+# Verify after:   scripts/verify-microvm.sh
+#
+# ---------------------------------------------------------------------------
+# WHAT CHANGES AT RUNTIME
+#
+#   Kernel. The pod boots its own kernel inside a Cloud Hypervisor VM instead
+#   of sharing the node's. That is the whole point, and it is what
+#   verify-microvm.sh asserts -- a guest kernel equal to the host kernel means
+#   the pod silently fell back to runc.
+#
+#   Effective resource request. The kata-clh RuntimeClass adds
+#   overhead.podFixed of 130Mi memory and 250m CPU, so the scheduler accounts
+#   for 350m / 258Mi per pod rather than 100m / 128Mi. On a 96-vCPU node that
+#   is immaterial; it is not immaterial to how many pods fit if the node ever
+#   shrinks. The HPA's percentage is still computed against the 100m container
+#   request, not the inflated figure.
+#
+#   Startup time. A VM boot is added to pod start -- seconds, not
+#   milliseconds. terminationGracePeriodSeconds stays at 10, which is still
+#   ample for a sleep loop.
+#
+#   NetworkPolicy still applies. Enforcement is on the pod's network
+#   namespace, which the VM is attached to through a tap device on the host
+#   side; the VPC CNI policy agent's eBPF programs sit on that host-side
+#   interface. Verified empirically rather than assumed --
+#   verify-microvm.sh re-runs the IMDS and egress checks from inside the
+#   microVM, because "the policy object still exists" is not evidence that it
+#   still enforces for a different runtime.
+###############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-runner
+  namespace: agent-sandbox
+# A code executor has no business holding a Kubernetes API credential. With
+# automount off there is no token at /var/run/secrets to steal. Unchanged from
+# runner.yaml -- and it matters more here, not less: a VM boundary protects the
+# node from the workload, it does nothing about a credential handed to the
+# workload.
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runner
+  namespace: agent-sandbox
+  labels:
+    app: agent-runner
+    role: code-executor
+  annotations:
+    sandbox.io/runtime: kata-clh
+    sandbox.io/supersedes: k8s/apps/runner.yaml
+spec:
+  # Starting replica count only. hpa.yaml owns this field after the first
+  # reconcile, which is why it is set to the HPA's minReplicas.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: agent-runner
+  template:
+    metadata:
+      labels:
+        app: agent-runner
+        role: code-executor
+    spec:
+      # ---- THE ONLY FUNCTIONAL CHANGE FROM runner.yaml ----
+      #
+      # Each pod now runs in a Cloud Hypervisor microVM with its own kernel.
+      # The handler behind this name is registered in the node's containerd
+      # config by kata-deploy; see k8s/kata/runtimeclass-clh.yaml.
+      runtimeClassName: kata-clh
+      # -----------------------------------------------------
+      serviceAccountName: agent-runner
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      # Pin to the bare metal sandbox node. The node group sets this label.
+      #
+      # Kept even though the RuntimeClass's own scheduling.nodeSelector
+      # (`katacontainers.io/kata-runtime=true`) would already constrain
+      # placement: the two express different requirements -- "this is a
+      # sandbox node" and "Kata works here" -- and a node could satisfy one
+      # without the other. Kubernetes ANDs them.
+      nodeSelector:
+        workload: sandbox
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runner
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          # Dummy workload. exec form with an explicit shell so SIGTERM is
+          # delivered to PID 1 and the pod terminates promptly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              trap 'echo "SIGTERM received, exiting"; exit 0' TERM
+              echo "agent-runner idle stub started on ${NODE_NAME} as ${POD_NAME}"
+              echo "kernel: $(uname -r)"
+              while true; do
+                sleep 30 &
+                wait $!
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Requests are what the HPA divides by: 50% of 100m means the HPA
+          # scales out at 50m of actual usage per pod. Unchanged from
+          # runner.yaml on purpose -- see the overhead note in the header for
+          # why the *scheduler* nonetheless sees 350m.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # Unchanged. These still apply inside the guest: the VM boundary is
+          # additional to them, not a replacement for them. Dropping container
+          # hardening because "it is in a VM now" would trade one boundary for
+          # another instead of having both.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Scratch space, since the root filesystem is read-only. Sized so a
+        # runaway write fills a bounded volume instead of the node's disk.
+        #
+        # Under Kata an emptyDir is backed inside the guest rather than by a
+        # host directory, so the sizeLimit is enforced against guest memory or
+        # the guest's own filesystem. 1Gi against a 256Mi memory limit means a
+        # runaway write hits the limit, not the node -- which is the intent
+        # either way.
+        - name: workspace
+          emptyDir:
+            sizeLimit: 1Gi

@@ -1,0 +1,99 @@
+###############################################################################
+# RuntimeClass: kata-clh (Kata Containers + Cloud Hypervisor)
+#
+# A pod gets a hardware-virtualised sandbox by asking for it:
+#
+#   spec:
+#     runtimeClassName: kata-clh
+#
+# PREREQUISITE. This object is inert on its own. `handler: kata-clh` is a
+# lookup key into the host's containerd configuration, and nothing registers
+# that handler until kata-deploy has run (k8s/kata/kata-setup.yaml). Applying
+# this file first is accepted by the API server and every pod using it then
+# fails to start with `RunContainerError: ... no runtime for "kata-clh" is
+# configured`. scripts/install-kata.sh applies it last, and checks the handler
+# exists on the node rather than trusting that this object does.
+#
+# This file is hand-written rather than chart-managed, which is a deliberate
+# deviation: `runtimeClasses.enabled: false` in kata-setup.yaml turns off the
+# chart's own RuntimeClass rendering so this object has one owner. The values
+# below mirror what the chart would have produced for the `clh` shim at 4.3.1
+# (templates/runtimeclasses.yaml), so switching back is possible. See the
+# trade-off note in kata-setup.yaml.
+###############################################################################
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-clh
+  labels:
+    app.kubernetes.io/name: kata-containers
+    app.kubernetes.io/component: runtimeclass
+    # Not `app.kubernetes.io/managed-by: kata-deploy` -- that is the label the
+    # chart stamps on objects it owns, and claiming it here would make a
+    # hand-managed object look chart-managed to anyone cleaning up.
+    sandbox.io/managed-by: install-kata-sh
+  annotations:
+    description: >-
+      Kata Containers with the Cloud Hypervisor VMM. Each pod runs in its own
+      lightweight VM with its own kernel, rather than sharing the host kernel
+      through namespaces.
+
+# The handler containerd looks up. MUST match the shim kata-deploy installed:
+# `shims.clh` in kata-setup.yaml produces the handler `kata-clh`. Enable a
+# different shim without changing this name and the RuntimeClass points at a
+# handler that does not exist.
+handler: kata-clh
+
+# Charged to the pod's effective resource request on top of its containers,
+# so the scheduler accounts for the VMM process and the guest kernel rather
+# than overcommitting the node.
+#
+# 130Mi/250m are the chart's own figures for Cloud Hypervisor. They are not a
+# guess and should not be trimmed to make a pod fit: with
+# sandbox_cgroup_only the VMM runs inside the pod's cgroup, so an overhead
+# smaller than the VMM's real footprint gets the VMM OOM-killed, which
+# presents as the pod dying for no visible reason.
+#
+# Consequence worth knowing: the agent runner requests 100m CPU and 128Mi.
+# Under this RuntimeClass its effective request becomes 350m and 258Mi, which
+# changes HPA arithmetic -- the HPA's 50% target is a percentage of the
+# container request, not of the request plus overhead, but the scheduler packs
+# against the larger figure.
+overhead:
+  podFixed:
+    memory: "130Mi"
+    cpu: "250m"
+
+scheduling:
+  # The gate that makes this safe. kata-deploy sets
+  # `katacontainers.io/kata-runtime=true` on a node as the LAST step of a
+  # successful install, so a pod asking for kata-clh can only land where the
+  # runtime is actually present and working.
+  #
+  # Without this, the scheduler would treat every node as a candidate and a
+  # Kata pod on a node without the shim fails at container creation. On a
+  # single-node cluster that distinction looks academic; it stops being
+  # academic the moment a second node group exists, or this one is recycled
+  # and comes back before kata-deploy has finished.
+  #
+  # `sandbox.io/kvm: "true"` is deliberately NOT repeated here. kata-deploy
+  # only runs on nodes carrying it (nodeSelector in kata-setup.yaml), so the
+  # label above already implies it, and restating it would create two places
+  # to keep in sync.
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+
+  # No tolerations: the node group applies no taints (verified 2026-10-23).
+  #
+  # If sandbox nodes are ever tainted -- a reasonable thing to do, so that
+  # only sandbox workloads land on the expensive bare-metal node -- the
+  # toleration must be added in BOTH places: here, for pods that use this
+  # RuntimeClass, and in kata-setup.yaml, for the kata-deploy DaemonSet
+  # itself. Adding it in only one place fails in a confusing direction:
+  # tolerate here but not there and the runtime is never installed on the node
+  # the pods are now allowed onto.
+  # tolerations:
+  #   - key: sandbox.io/dedicated
+  #     operator: Equal
+  #     value: "true"
+  #     effect: NoSchedule

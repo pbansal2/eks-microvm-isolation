@@ -1,0 +1,58 @@
+###############################################################################
+# Autoscaling for agent-runner
+#
+# DEPENDENCY: an HPA with a CPU target needs the metrics.k8s.io API, which
+# this cluster does not serve out of the box -- EKS ships no metrics-server.
+# Without it the HPA reports
+#   FailedGetResourceMetric: no metrics returned from resource metrics API
+# and never scales.
+#
+# The official metrics-server manifest is applied from upstream by
+# scripts/deploy-baseline.sh; it cannot be inlined here because it is a
+# remote URL, not a local object:
+#
+#   kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+#
+# Note that `latest` is resolved at apply time, so two operators running this
+# on different days can install different versions. Pin the tag in the URL if
+# that matters -- see the PIN comment in scripts/deploy-baseline.sh.
+###############################################################################
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-runner
+  namespace: agent-sandbox
+  labels:
+    app: agent-runner
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent-runner
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Percentage of the pod's CPU *request* (100m), not of a core.
+          # 50% means scale out above 50m of real usage per pod.
+          averageUtilization: 50
+  behavior:
+    scaleUp:
+      # Default is 0s, which makes the HPA react to a single 15s metrics
+      # sample. 60s absorbs scrape jitter without noticeably slowing a real
+      # ramp.
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

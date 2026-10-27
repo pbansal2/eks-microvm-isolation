@@ -1,0 +1,49 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is gitignored.
+
+region       = "us-east-1"
+cluster_name = "secure-agent-sandbox"
+environment  = "dev"
+
+# EKS standard support currently covers 1.31 - 1.37.
+kubernetes_version = "1.33"
+
+vpc_cidr = "10.0.0.0/16"
+az_count = 2
+
+# Single NAT Gateway: ~$32/mo instead of ~$64/mo, at the cost of AZ redundancy.
+single_nat_gateway = true
+
+# REQUIRED. Who may reach the public Kubernetes API endpoint.
+# Find your current egress address with:
+#   curl -s https://checkip.amazonaws.com
+# 0.0.0.0/0 is rejected by variable validation, and an empty list with public
+# access on is rejected by a precondition (EKS reads empty as 0.0.0.0/0).
+#
+# Simplest to start with: kubectl works directly, scripts/connect.sh just runs
+# `aws eks update-kubeconfig`. Egress IPs rotate (VPN, home ISP), and when
+# yours does kubectl times out -- update this value and re-apply.
+cluster_endpoint_public_access       = true
+cluster_endpoint_public_access_cidrs = ["203.0.113.4/32"] # <-- CHANGE ME
+
+# Tightest posture: no public endpoint at all.
+# scripts/connect.sh then opens an SSM port-forward through a node instead;
+# that needs the AWS Session Manager plugin installed locally.
+#
+# Keep a scoped /32 in the CIDR list even here, rather than []. EKS retains the
+# last value when public access is turned off, so [] produces a permanent
+# phantom diff in every plan. The value grants nothing while
+# public access is false -- but it becomes live again if you flip it back.
+# cluster_endpoint_public_access       = false
+# cluster_endpoint_public_access_cidrs = ["203.0.113.4/32"]
+
+# Bare metal is required for /dev/kvm on AWS provider ~> 5.0.
+# ~$4.08/hr on-demand in us-east-1 -- destroy the stack when you are done.
+node_instance_type = "c5.metal"
+node_desired_size  = 1
+node_min_size      = 1
+node_max_size      = 1
+node_disk_size     = 50
+
+tags = {
+  Owner = "CHANGE_ME" # your name or team, for cost attribution
+}

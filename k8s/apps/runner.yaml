@@ -1,0 +1,141 @@
+###############################################################################
+# Agent Code Runner
+#
+# Placeholder workload that will eventually execute untrusted agent code.
+# Today it sleeps: the point of this manifest is to establish the scheduling,
+# labelling and resource shape before any code execution exists.
+#
+# RUNTIME: default `runc`. No runtimeClassName is set, so these pods share the
+# host kernel with everything else on the node. Treat a pod from this manifest
+# as having NO isolation boundary against the node, and do not run untrusted
+# code in it.
+#
+# THIS IS NO LONGER WHAT IS DEPLOYED, as of 2026-10-23. Kata Containers with
+# Cloud Hypervisor is installed and `k8s/apps/runner-microvm.yaml` -- the same
+# Deployment plus `runtimeClassName: kata-clh` -- is applied instead. Verified:
+# guest kernel 6.18.56 against host 6.12.111-136.204.amzn2023.x86_64.
+#
+# This file is kept for two reasons, not as dead weight:
+#
+#   1. It is the measurement baseline. scripts/verify-microvm.sh proves VM
+#      isolation by showing the guest kernel differs from the host's, and a
+#      runc pod is the control that makes that comparison falsifiable.
+#   2. It is the rollback target: scripts/verify-microvm.sh --rollback.
+#
+# NEVER APPLY BOTH. They declare the same Deployment, so whichever is applied
+# last wins and the other becomes a false statement about the cluster.
+#
+# In particular, `kubectl apply -f` of THIS file on a migrated cluster DOES
+# remove runtimeClassName and silently moves the runner back onto the host
+# kernel: the field is in the last-applied configuration (written by applying
+# runner-microvm.yaml) but absent here, so apply deletes it. Confirmed with a
+# server-side dry run, 2026-10-27. scripts/deploy-baseline.sh therefore picks
+# the manifest that matches the live runtime rather than always using this one.
+#
+# (If runtimeClassName had been added by `kubectl patch` instead, apply would
+# leave it alone -- which is why scripts/verify-microvm.sh --rollback also
+# removes it explicitly. It is correct either way.)
+#
+# Keep every other field in step with runner-microvm.yaml. The NetworkPolicy
+# selects `role: code-executor`, hpa.yaml targets Deployment/agent-runner, and
+# the HPA's 50% target is a percentage of the cpu request below.
+# verify-microvm.sh diffs the two files on every run and fails on drift.
+###############################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-runner
+  namespace: agent-sandbox
+# A code executor has no business holding a Kubernetes API credential. With
+# automount off there is no token at /var/run/secrets to steal.
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-runner
+  namespace: agent-sandbox
+  labels:
+    app: agent-runner
+    role: code-executor
+spec:
+  # Starting replica count only. hpa.yaml owns this field after the first
+  # reconcile, which is why it is set to the HPA's minReplicas.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: agent-runner
+  template:
+    metadata:
+      labels:
+        app: agent-runner
+        role: code-executor
+    spec:
+      serviceAccountName: agent-runner
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      # Pin to the bare metal sandbox node. The node group sets this label;
+      # it keeps runners off any future general-purpose node pool and makes
+      # the eventual Kata move a runtimeClassName addition, not a rescheduling
+      # exercise.
+      nodeSelector:
+        workload: sandbox
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runner
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          # Dummy workload. exec form with an explicit shell so SIGTERM is
+          # delivered to PID 1 and the pod terminates promptly.
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              trap 'echo "SIGTERM received, exiting"; exit 0' TERM
+              echo "agent-runner idle stub started on ${NODE_NAME} as ${POD_NAME}"
+              while true; do
+                sleep 30 &
+                wait $!
+              done
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # Requests are what the HPA divides by: 50% of 100m means the HPA
+          # scales out at 50m of actual usage per pod.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: workspace
+              mountPath: /workspace
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        # Scratch space, since the root filesystem is read-only. Sized so a
+        # runaway write fills a bounded volume instead of the node's disk.
+        - name: workspace
+          emptyDir:
+            sizeLimit: 1Gi

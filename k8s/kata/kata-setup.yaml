@@ -1,0 +1,207 @@
+###############################################################################
+# Kata Containers install -- Helm values for the upstream `kata-deploy` chart
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS A VALUES FILE AND NOT A kubectl MANIFEST
+#
+# The task specified these two commands:
+#
+#   kubectl apply -f .../kata-deploy/kata-rbac/base/kata-rbac.yaml
+#   kubectl apply -f .../kata-deploy/kata-deploy/base/kata-deploy.yaml
+#
+# Both return **HTTP 404** on `main` (checked 2026-10-23). They are not
+# mistyped -- upstream deleted them. The raw kustomize manifests existed up to
+# and including tag **3.21.0** and were removed in the **4.x** rewrite, where
+# `kata-deploy` became a Rust binary driven by a Helm chart. Verified by
+# diffing the git trees of the two tags:
+#
+#   4.3.1    tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml  ABSENT
+#            tools/packaging/kata-deploy/kata-rbac/base/kata-rbac.yaml      ABSENT
+#            tools/packaging/kata-deploy/helm-chart/kata-deploy/Chart.yaml  PRESENT
+#   3.21.0   all three PRESENT
+#
+# So there is no file to `kubectl apply`. The chart renders the RBAC and the
+# DaemonSet that the task asked for; this file is the declarative input that
+# pins every choice. `scripts/install-kata.sh --render` writes the rendered
+# objects to disk so they can be reviewed before anything is applied, which
+# keeps the "review before apply" property this project requires.
+#
+# The 3.21.0 manifests remain an option and would match the requested commands
+# literally. They are not used because they are the interface upstream removed:
+# no fixes land there, and 3.21.0's installer is a 951-line shell script where
+# 4.x has the containerd config-version handling in typed code
+# (`binary/src/utils/containerd_config_version.rs`) -- which matters here, see
+# the containerd note below.
+#
+# ---------------------------------------------------------------------------
+# THIS NODE
+#
+# Verified on ip-10-0-152-183 (c5.metal), 2026-10-23:
+#
+#   /dev/kvm            crw-rw-rw- 10,232        present
+#   containerd          2.3.5
+#   /etc/containerd/config.toml   version = 3
+#   no /etc/containerd/config.d/, no `imports` line
+#   SELinux             Permissive
+#   /opt/kata           absent (Kata not yet installed)
+#
+# `version = 3` is the reason the version choice is not cosmetic. containerd
+# 2.x renamed the CRI plugin key from `io.containerd.grpc.v1.cri` to
+# `io.containerd.cri.v1.runtime`, and a `version = 3` file gets no automatic
+# migration. An installer that writes the old key registers a runtime handler
+# that containerd never reads: `kubectl get runtimeclass` would show `kata-clh`
+# and every pod using it would fail to start. 4.x handles this explicitly.
+#
+# ---------------------------------------------------------------------------
+# WHAT APPLYING THIS DOES TO THE HOST -- READ BEFORE INSTALLING
+#
+# kata-deploy writes binaries under /opt/kata, edits the host's containerd
+# configuration, and then restarts containerd
+# (`binary/src/runtime/lifecycle.rs`, `restart_runtime`).
+#
+# What it takes to do that, read off the rendered chart rather than assumed --
+# and it is narrower than the "privileged DaemonSet" this file first claimed:
+#
+#   securityContext.privileged     false  (0 privileged containers in the render)
+#   RBAC                           nodes get/patch, nodes/proxy get,
+#                                  daemonsets get/list/watch. Nothing else.
+#   host mounts, READ-ONLY         /usr/bin /usr/sbin /usr/local/bin
+#                                  /usr/local/sbin /bin /sbin /boot
+#                                  /etc/machine-id
+#   host mounts, WRITABLE          /etc/containerd/  /opt/kata
+#                                  /etc/systemd/system  /run/systemd/private
+#                                  /etc/crio/  /run/lock
+#
+# Do not read "not privileged" as "not powerful". Write access to
+# /etc/systemd/system plus the systemd private D-Bus socket at
+# /run/systemd/private is how it restarts containerd without being
+# privileged, and it is root-equivalent on the host: anything that can ask
+# PID 1 to start a unit can run arbitrary code as root. The improvement over
+# 3.x -- which used a fully privileged container -- is that the surface is
+# narrow, enumerable and reviewable, not that it is small.
+#
+# This cluster has ONE node. Restarting containerd restarts **every pod on
+# it** -- both gateway replicas, the runner, CoreDNS, aws-node, metrics-server
+# and the load balancer controller. The gateway's NLB targets go unhealthy and
+# the endpoint stops answering until they pass health checks again, which took
+# 285s when first measured (RUNBOOK.md section 7). The PodDisruptionBudget
+# does not help: this is a runtime restart, not an eviction.
+#
+# scripts/install-kata.sh prompts once before this happens.
+###############################################################################
+
+# Match the task's request for a DaemonSet. The chart's own default is `job`:
+# a dispatcher creates one install Job per node and leaves nothing running.
+#
+# `daemonset` is chosen here for two reasons beyond matching the request.
+# Deleting the DaemonSet makes kata-deploy REVERT the host changes on pod
+# termination, which is the clean uninstall this sandbox needs. And `job` mode
+# only runs on helm install/upgrade, so a replacement node -- likely in a
+# single-node group that gets recycled -- would silently come up without Kata.
+#
+# Cost: a privileged pod stays resident on every matching node for the life of
+# the install, rather than exiting once the work is done.
+deploymentMode: daemonset
+
+# Only install on nodes that can actually run a VM. `sandbox.io/kvm=true` is
+# set by this project's node group (terraform/eks.tf) on bare-metal instances.
+#
+# Not cosmetic: on a node without /dev/kvm, kata-deploy installs successfully,
+# labels the node `katacontainers.io/kata-runtime=true`, and every Kata pod
+# then fails at VM start. The failure surfaces as a pod-level error far from
+# its cause. Restricting by this label keeps a non-metal node out of the
+# RuntimeClass's scheduling set entirely.
+nodeSelector:
+  sandbox.io/kvm: "true"
+
+# No tolerations. The node carries no taints (verified 2026-10-23,
+# `.spec.taints` is empty). Add them here if a future node group taints
+# sandbox nodes, or the DaemonSet will not schedule.
+tolerations: []
+
+###############################################################################
+# Shims: Cloud Hypervisor only
+#
+# `disableAll: true` then enabling one shim is the opposite of the chart
+# default, which installs every shim for the architecture -- qemu, firecracker,
+# stratovirt, dragonball, the runtime-rs variants and the confidential-computing
+# ones. The task asked for Cloud Hypervisor support, and each extra shim is
+# more privileged binary on the host and another RuntimeClass that nothing in
+# this project uses.
+#
+# Cost: switching to QEMU later is a values change plus a reinstall, not a
+# label change. Worth it -- `kubectl get runtimeclass` returning one row that
+# is the one we want is a better operator experience than fourteen.
+###############################################################################
+shims:
+  disableAll: true
+  clh:
+    enabled: true
+    supportedArches:
+      - amd64
+
+# MUST be one of the shims enabled above.
+#
+# The chart defaults this to `qemu-runtime-rs` on every architecture, which is
+# fine with the chart's own default of "install every shim" and fatal with
+# `disableAll: true`. kata-deploy validates it at startup and exits 1:
+#
+#   Error: DEFAULT_SHIM 'qemu-runtime-rs' must be one of the configured
+#          SHIMS for this architecture: [clh]
+#
+# That cost a CrashLoopBackOff on the first real install attempt. Nothing
+# catches it earlier: the check lives in the kata-deploy binary, so
+# `helm template` renders happily and `install-kata.sh --render` reports a
+# clean 9-object manifest. The install script now cross-checks the two lists
+# in preflight instead of waiting for the pod to crash.
+#
+# Only amd64 is set because `shims.clh.supportedArches` is amd64-only; this
+# node is c5.metal. Enable clh on another arch and set it here too.
+defaultShim:
+  amd64: clh
+
+# The chart would otherwise create the RuntimeClasses itself, named after each
+# enabled shim -- including `kata-clh`. Turned off so that object has exactly
+# one owner: k8s/kata/runtimeclass-clh.yaml.
+#
+# The task asked for a hand-written RuntimeClass with its own nodeSelector, and
+# two managers for one object means `helm upgrade` silently reverts local
+# edits. The hand-written file mirrors what the chart would have produced,
+# including the 130Mi/250m overhead it sets for clh.
+#
+# Cost: the overhead values and the handler name are now copies. If a future
+# chart changes them, this file will not notice. The handler name is checked
+# against the installed shim by scripts/install-kata.sh.
+runtimeClasses:
+  enabled: false
+
+# Stock upstream EKS/AL2023 layout: /etc/containerd/config.toml, socket at
+# /run/containerd/containerd.sock. Left to the `k8s` preset rather than
+# hardcoded, so the chart's own detection stays in charge.
+k8sDistribution: "k8s"
+containerd:
+  configDir: ""
+  runtimeSocket: ""
+  configFileName: ""
+  userDropIn: ""
+
+# Both default to false in the chart; stated explicitly so an upstream default
+# flip cannot quietly add components. node-feature-discovery is only needed to
+# advertise TEE capabilities (SEV-SNP, TDX), which c5.metal does not have.
+node-feature-discovery:
+  enabled: false
+monitor:
+  enabled: false
+
+# Image tag is left empty on purpose: the chart then uses its own appVersion,
+# so the chart version pinned in scripts/install-kata.sh (KATA_CHART_VERSION)
+# determines the payload too. Setting a tag here would let the two drift.
+image:
+  reference: quay.io/kata-containers/kata-deploy
+  tag: ""
+
+# Guest debug off. `debug: true` would also make the chart create extra
+# `kata-clh-debug` RuntimeClasses with an agent debug console, which is a shell
+# into the guest and not something a sandbox for untrusted code should ship.
+debug: false
+devkit: false
